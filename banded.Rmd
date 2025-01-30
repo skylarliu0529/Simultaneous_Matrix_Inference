@@ -1,0 +1,1080 @@
+---
+title: "simulation_draft"
+author: "刘思洋"
+date: "2024-10-01"
+output: html_document
+---
+```{r}
+rm(list = ls())
+library(MASS)
+library(Matrix)
+library(glmnet)
+library(knockoff)
+library(mvtnorm)
+library(hdi)
+library(doParallel)
+library(doSNOW)
+library(foreach)
+```
+
+### FDR, power, 样本平均和样本方差的辅助函数
+```{r}
+analys <- function(mm, ww, q){
+  ### mm: mirror statistics
+  ### ww: absolute value of mirror statistics
+  ### q:  FDR control level
+  cutoff_set <- max(ww)
+  for(t in ww){
+    ps <- length(mm[mm > t])
+    ng <- length(na.omit(mm[mm < -t]))
+    rto <- (ng + 1)/max(ps, 1)
+    if(rto <= q){
+      cutoff_set <- c(cutoff_set, t)
+    }
+  }
+  cutoff <- min(cutoff_set)
+  selected_index <- which(mm > cutoff)
+  
+  return(selected_index)
+}
+### anciliary functions
+fdp_power <- function(selected_index, signal_index){
+  num_selected <- length(selected_index)
+  tp <- length(intersect(selected_index, signal_index))
+  fp <- num_selected - tp
+  fdp <- fp / max(num_selected, 1)
+  power <- tp / length(signal_index)
+  return(list(fdp = fdp, power = power,model_size = length(selected_index), real_model_size = length(signal_index)))
+}
+
+replications <- 50
+results_list <- vector("list", replications)
+
+mean.se = function(x, ns = 1) { paste0(format(round(mean(x)*1, ns), nsmall=ns), ' (', format(round(1*sd(x)/sqrt(length(x)), ns), nsmall=ns), ')')}
+```
+
+```{r}
+Signal_index <- function(Sigma_0) {
+  # Set lower triangular elements to 0
+  Sig_0_upper <- Sigma_0
+  Sig_0_upper[lower.tri(Sig_0_upper)] <- 0
+  # Extract upper triangular elements, arranged by row
+  upper_tri_vector <- Sig_0_upper[upper.tri(Sig_0_upper, diag = TRUE)]
+  # Get indices of non-zero elements
+  signal_index <- which(upper_tri_vector != 0)
+  
+  return(signal_index)
+}
+```
+
+### Generate data
+```{r}
+# Function to generate A1 matrix (banded covariance matrix)
+A_1_sigma <- function(p) {
+  # Use outer to compute the pairwise function 1 - |i-j|/10 for all i,j
+  mat <- outer(1:p, 1:p, FUN = function(i, j) 1 - abs(i - j)/10)
+  
+  # Ensure that values below 0 are set to 0
+  mat <- pmax(mat, 0)
+  
+  return(mat)
+}
+
+
+A_2_sigma <- function(p) {
+  matrix <- diag(4, p, p)
+  return(matrix)
+}
+
+sigma_0 <- function(p) {
+  A1 <- A_1_sigma(p / 2)  
+  A2 <- A_2_sigma(p / 2)
+  
+  # Full block diagonal matrix Sigma_0
+  sigma_0 <- matrix(0, nrow = p, ncol = p)
+  sigma_0[1:(p/2), 1:(p/2)] <- A1
+  sigma_0[(p/2+1):p, (p/2+1):p] <- A2
+  return(sigma_0)
+}
+```
+
+### data-splitting methods (DS and MDS)(mle)
+```{r}
+DS <- function(X, num_split, q){
+  n <- dim(X)[1]; p <- dim(X)[2]
+  num_upper_tri_elements <- p * (p + 1) / 2
+  inclusion_rate <- matrix(0, nrow = num_split, ncol = num_upper_tri_elements)
+ # inclusion_rate <- matrix(0, nrow = num_split, ncol = p)
+  fdp <- rep(0, num_split)
+  power <- rep(0, num_split)
+  num_select <- rep(0, num_split)
+  
+  for(iter in 1:num_split){
+    ### randomly split the data
+    sample_index1 <- sample(x = c(1:n), size = 0.5 * n, replace = F)
+    sample_index2 <- setdiff(c(1:n), sample_index1)
+    
+    ### get mle on the first half of data
+    S  = cov(X[sample_index1, ])               
+    mu_mle  = colMeans(X[sample_index1, ])    
+    Sig_mle = (n-1)*S/n      
+    Sig_mle_upper <- Sig_mle
+    Sig_mle_upper[lower.tri(Sig_mle_upper)] <- 0  # Set lower triangular elements to 0
+    # Extract non-zero values by row and arrange them as a vector
+    upper_tri_vector <- Sig_mle_upper[upper.tri(Sig_mle_upper, diag = TRUE)]
+    beta1 <- upper_tri_vector
+    nonzero_index <- which(beta1 != 0)
+    if(length(nonzero_index)!=0){ 
+    
+    ### get mle on the second half of data
+    S  = cov(X[sample_index2, ])               
+    mu_mle  = colMeans(X[sample_index2, ])    
+    Sig_mle = (n-1)*S/n      
+    Sig_mle_upper <- Sig_mle
+    Sig_mle_upper[lower.tri(Sig_mle_upper)] <- 0  # Set lower triangular elements to 0
+    # Extract non-zero values by row and arrange them as a vector
+    upper_tri_vector <- Sig_mle_upper[upper.tri(Sig_mle_upper, diag = TRUE)]
+    beta2 <- upper_tri_vector
+    
+    ### calculate the mirror statistics
+      M <- sign(beta1 * beta2) * (abs(beta1) + abs(beta2))
+      # M <- abs(beta1 + beta2) - abs(beta1 - beta2)
+      DS_selected_index <- analys(M, abs(M), q)
+      
+      ### number of selected variables
+      if(length(DS_selected_index)!=0){
+        num_select[iter] <- length(DS_selected_index)
+        inclusion_rate[iter, DS_selected_index] <- 1/num_select[iter]
+        
+        ### calculate fdp and power
+        result <- fdp_power(DS_selected_index, signal_index)
+        fdp[iter] <- result$fdp
+        power[iter] <- result$power
+      }
+    }
+  }
+  
+  ### single data-splitting (DS) result
+  DS_fdp <- fdp[1]
+  DS_power <- power[1]
+  
+  ### multiple data-splitting (MDS) result
+  inclusion_rate <- apply(inclusion_rate, 2, mean)
+  
+  ### rank the features by the empirical inclusion rate
+  feature_rank <- order(inclusion_rate)
+  feature_rank <- setdiff(feature_rank, which(inclusion_rate == 0))
+  if(length(feature_rank)!=0){
+    null_feature <- numeric()
+    
+    ### backtracking 
+    for(feature_index in 1:length(feature_rank)){
+      if(sum(inclusion_rate[feature_rank[1:feature_index]]) > q){
+        break
+      }else{
+        null_feature <- c(null_feature, feature_rank[feature_index])
+      }
+    }
+    MDS_selected_index <- setdiff(feature_rank, null_feature)
+    
+    ### calculate fdp and power
+    result <- fdp_power(MDS_selected_index, signal_index)
+    MDS_fdp <- result$fdp
+    MDS_power <- result$power
+  }
+   else{
+    MDS_fdp <- 0
+    MDS_power <- 0
+  }
+  return(list(DS_fdp = DS_fdp, DS_power = DS_power, MDS_fdp = MDS_fdp, MDS_power = MDS_power, DS_model_size = length(DS_selected_index), MDS_model_size = length(MDS_selected_index), real_model_size = length(signal_index)))
+ }
+```
+
+### p=10, n=300
+```{r}
+p <- 10
+n <- 300
+Sigma_0 <- sigma_0(p)
+mean_vector <- rep(0, p)
+set.seed(123)
+for (i in 1:replications) {
+  X <- mvrnorm(n = n, mu = mean_vector, Sigma = Sigma_0)
+  signal_index <- Signal_index(Sigma_0)
+  results_list[[i]] <- DS(X, 50, 0.1)
+}
+elements <- names(results_list[[1]])
+empirical_results <- sapply(elements, function(element) {
+  values <- sapply(results_list, function(res) res[[element]])
+  mean.se(values, ns = 2)
+})
+
+empirical_results
+```
+### p=50, n=300
+```{r}
+p <- 50
+n <- 300
+Sigma_0 <- sigma_0(p)
+mean_vector <- rep(0, p)
+set.seed(123)
+for (i in 1:replications) {
+  X <- mvrnorm(n = n, mu = mean_vector, Sigma = Sigma_0)
+  signal_index <- Signal_index(Sigma_0)
+  results_list[[i]] <- DS(X, 50, 0.1)
+}
+elements <- names(results_list[[1]])
+empirical_results <- sapply(elements, function(element) {
+  values <- sapply(results_list, function(res) res[[element]])
+  mean.se(values, ns = 2)
+})
+
+empirical_results
+```
+
+### p=100, n=300
+```{r}
+p <- 100
+n <- 300
+Sigma_0 <- sigma_0(p)
+mean_vector <- rep(0, p)
+set.seed(123)
+for (i in 1:replications) {
+  X <- mvrnorm(n = n, mu = mean_vector, Sigma = Sigma_0)
+  signal_index <- Signal_index(Sigma_0)
+  results_list[[i]] <- DS(X, 50, 0.1)
+}
+elements <- names(results_list[[1]])
+empirical_results <- sapply(elements, function(element) {
+  values <- sapply(results_list, function(res) res[[element]])
+  mean.se(values, ns = 2)
+})
+
+empirical_results
+```
+### p=200, n=300
+```{r}
+p <- 300
+n <- 300
+Sigma_0 <- sigma_0(p)
+mean_vector <- rep(0, p)
+set.seed(123)
+for (i in 1:replications) {
+  X <- mvrnorm(n = n, mu = mean_vector, Sigma = Sigma_0)
+  signal_index <- Signal_index(Sigma_0)
+  results_list[[i]] <- DS(X, 50, 0.1)
+}
+elements <- names(results_list[[1]])
+empirical_results <- sapply(elements, function(element) {
+  values <- sapply(results_list, function(res) res[[element]])
+  mean.se(values, ns = 2)
+})
+
+empirical_results
+```
+## Parallel
+```{r}
+# Define parameters
+p <- 300
+n <- 300
+replications <- 50
+
+# Pre-compute objects that remain constant across all replications
+Sigma_0 <- sigma_0(p)
+mean_vector <- rep(0, p)
+cl <- makeCluster(7, type = "SOCK")
+registerDoSNOW(cl)
+
+set.seed(123)
+
+# Run the replications in parallel
+results_list <- foreach(i = 1:replications, .combine = 'list', .packages = c("MASS")) %dopar% {
+  # Generate data for this replication
+  X <- mvrnorm(n = n, mu = mean_vector, Sigma = Sigma_0)
+  
+  # Compute indices and run DS() for this replication
+  signal_index <- Signal_index(Sigma_0)
+  DS(X, 50, 0.1) # This should return a list or named vector
+}
+
+# Stop the cluster after computations
+stopCluster(cl)
+
+# Extract elements from the results (assuming results_list[[1]] is representative)
+elements <- names(results_list[[1]])
+
+empirical_results <- sapply(elements, function(element) {
+  values <- sapply(results_list, function(res) res[[element]])
+  mean.se(values, ns = 2)
+})
+
+empirical_results
+```
+
+
+### p=300, n=300
+```{r}
+p <- 300
+n <- 300
+Sigma_0 <- sigma_0(p)
+mean_vector <- rep(0, p)
+set.seed(123)
+for (i in 1:replications) {
+  X <- mvrnorm(n = n, mu = mean_vector, Sigma = Sigma_0)
+  signal_index <- Signal_index(Sigma_0)
+  results_list[[i]] <- DS(X, 50, 0.1)
+}
+elements <- names(results_list[[1]])
+empirical_results <- sapply(elements, function(element) {
+  values <- sapply(results_list, function(res) res[[element]])
+  mean.se(values, ns = 2)
+})
+
+empirical_results
+```
+### p=500, n=800
+```{r}
+p <- 500
+n <- 800
+Sigma_0 <- sigma_0(p)
+mean_vector <- rep(0, p)
+set.seed(123)
+for (i in 1:replications) {
+  X <- mvrnorm(n = n, mu = mean_vector, Sigma = Sigma_0)
+  signal_index <- Signal_index(Sigma_0)
+  results_list[[i]] <- DS(X, 50, 0.1)
+}
+elements <- names(results_list[[1]])
+empirical_results <- sapply(elements, function(element) {
+  values <- sapply(results_list, function(res) res[[element]])
+  mean.se(values, ns = 2)
+})
+
+empirical_results
+```
+### p=500, n=1000
+```{r}
+p <- 500
+n <- 1000
+Sigma_0 <- sigma_0(p)
+mean_vector <- rep(0, p)
+set.seed(123)
+for (i in 1:replications) {
+  X <- mvrnorm(n = n, mu = mean_vector, Sigma = Sigma_0)
+  signal_index <- Signal_index(Sigma_0)
+  results_list[[i]] <- DS(X, 50, 0.1)
+}
+elements <- names(results_list[[1]])
+empirical_results <- sapply(elements, function(element) {
+  values <- sapply(results_list, function(res) res[[element]])
+  mean.se(values, ns = 2)
+})
+
+empirical_results
+```
+
+### p=500, n=1500
+```{r}
+p <- 500
+n <- 1500
+Sigma_0 <- sigma_0(p)
+set.seed(2024) 
+mean_vector <- rep(0, p)
+X <- mvrnorm(n = n, mu = mean_vector, Sigma = Sigma_0)
+signal_index <- Signal_index(Sigma_0)
+
+result=DS(X,50,0.1)
+result
+```
+### p=500, n=2000
+```{r}
+p <- 500
+n <- 2000
+Sigma_0 <- sigma_0(p)
+set.seed(2024) 
+mean_vector <- rep(0, p)
+X <- mvrnorm(n = n, mu = mean_vector, Sigma = Sigma_0)
+signal_index <- Signal_index(Sigma_0)
+
+result=DS(X,50,0.1)
+result
+```
+### p=500, n=3000
+```{r}
+p <- 500
+n <- 3000
+Sigma_0 <- sigma_0(p)
+set.seed(2024) 
+mean_vector <- rep(0, p)
+X <- mvrnorm(n = n, mu = mean_vector, Sigma = Sigma_0)
+signal_index <- Signal_index(Sigma_0)
+
+result=DS(X,50,0.1)
+result
+```
+### p=500, n=5000
+```{r}
+p <- 500
+n <- 5000
+Sigma_0 <- sigma_0(p)
+set.seed(2024) 
+mean_vector <- rep(0, p)
+X <- mvrnorm(n = n, mu = mean_vector, Sigma = Sigma_0)
+signal_index <- Signal_index(Sigma_0)
+
+result=DS(X,50,0.1)
+result
+```
+### p=1000, n=2000
+```{r}
+p <- 1000
+n <- 2000
+Sigma_0 <- sigma_0(p)
+set.seed(2024) 
+mean_vector <- rep(0, p)
+X <- mvrnorm(n = n, mu = mean_vector, Sigma = Sigma_0)
+signal_index <- Signal_index(Sigma_0)
+
+result=DS(X,50,0.1)
+result
+```
+### BH,BY
+#### p value
+sigma的mle估计分布-->sigma逐元素分布(卡方分布)-->p值
+
+```{r}
+get_p_value <- function(X, p, n) {
+  # Calculate the sample covariance matrix
+  S <- cov(X)
+  # Define the MLE-adjusted covariance matrix
+  Sig_mle <- (n - 1) * S / n  # MLE estimator for the covariance matrix
+
+  # Initialize a matrix to store p-values for each test
+  p_values <- matrix(NA, nrow = p, ncol = p)
+
+  # Loop over the upper triangular part of Sig_mle to perform chi-square tests
+  for (i in 1:(p-1)) {
+    for (j in (i+1):p) {
+      # Extract the adjusted sample covariance for this pair
+      Sigma_ij <- Sig_mle[i, j]
+
+      # Calculate the chi-square statistic
+      chi_square_stat <- (n * Sigma_ij^2) / (Sig_mle[i, i] * Sig_mle[j, j])
+
+      # Calculate the p-value from the chi-square distribution with 1 degree of freedom
+      p_values[i, j] <- pchisq(chi_square_stat, df = 1, lower.tail = FALSE)
+    }
+  }
+
+  # Flatten the upper triangular p-values
+  p_values_upper <- p_values[upper.tri(p_values)]
+
+  return(p_values_upper)
+}
+
+# Initialize storage for results
+replications <- 50
+results_list_BH <- vector("list", replications)
+results_list_BY <- vector("list", replications)
+```
+#### 10, 300
+```{r}
+p <- 10
+n <- 300
+Sigma_0 <- sigma_0(p)
+mean_vector <- rep(0, p)
+set.seed(2024)
+for (i in 1:replications) {
+  X <- mvrnorm(n = n, mu = mean_vector, Sigma = Sigma_0)
+  signal_index <- Signal_index(Sigma_0)
+  # Apply BH method
+  p_values_upper <- get_p_value(X, p, n)
+  adh_BH <- p.adjust(p_values_upper, method = "BH") < 0.1
+  ahh_S_BH <- which(as.vector(adh_BH) == TRUE)
+  results_list_BH[[i]] <- fdp_power(selected_index = ahh_S_BH, signal_index = signal_index)
+  # Apply BY method
+  adh_BY <- p.adjust(p_values_upper, method = "BY") < 0.1
+  ahh_S_BY <- which(as.vector(adh_BY) == TRUE)
+  results_list_BY[[i]] <- fdp_power(selected_index = ahh_S_BY, signal_index = signal_index)
+}
+
+elements_BH <- names(results_list_BH[[1]])
+empirical_results_BH <- sapply(elements_BH, function(element) {
+  values <- sapply(results_list_BH, function(res) res[[element]])
+  mean.se(values, ns = 2)
+})
+
+elements_BY <- names(results_list_BY[[1]])
+empirical_results_BY <- sapply(elements_BY, function(element) {
+  values <- sapply(results_list_BY, function(res) res[[element]])
+  mean.se(values, ns = 2)
+})
+
+list(BH = empirical_results_BH, BY = empirical_results_BY)
+```
+### 50, 300
+```{r}
+p <- 50
+n <- 300
+Sigma_0 <- sigma_0(p)
+mean_vector <- rep(0, p)
+set.seed(2024)
+for (i in 1:replications) {
+  X <- mvrnorm(n = n, mu = mean_vector, Sigma = Sigma_0)
+  signal_index <- Signal_index(Sigma_0)
+  # Apply BH method
+  p_values_upper <- get_p_value(X, p, n)
+  adh_BH <- p.adjust(p_values_upper, method = "BH") < 0.1
+  ahh_S_BH <- which(as.vector(adh_BH) == TRUE)
+  results_list_BH[[i]] <- fdp_power(selected_index = ahh_S_BH, signal_index = signal_index)
+  # Apply BY method
+  adh_BY <- p.adjust(p_values_upper, method = "BY") < 0.1
+  ahh_S_BY <- which(as.vector(adh_BY) == TRUE)
+  results_list_BY[[i]] <- fdp_power(selected_index = ahh_S_BY, signal_index = signal_index)
+}
+
+elements_BH <- names(results_list_BH[[1]])
+empirical_results_BH <- sapply(elements_BH, function(element) {
+  values <- sapply(results_list_BH, function(res) res[[element]])
+  mean.se(values, ns = 2)
+})
+
+elements_BY <- names(results_list_BY[[1]])
+empirical_results_BY <- sapply(elements_BY, function(element) {
+  values <- sapply(results_list_BY, function(res) res[[element]])
+  mean.se(values, ns = 2)
+})
+
+list(BH = empirical_results_BH, BY = empirical_results_BY)
+```
+
+#### 100,300
+```{r}
+p <- 100
+n <- 300
+Sigma_0 <- sigma_0(p)
+mean_vector <- rep(0, p)
+set.seed(2024)
+for (i in 1:replications) {
+  X <- mvrnorm(n = n, mu = mean_vector, Sigma = Sigma_0)
+  signal_index <- Signal_index(Sigma_0)
+  # Apply BH method
+  p_values_upper <- get_p_value(X, p, n)
+  adh_BH <- p.adjust(p_values_upper, method = "BH") < 0.1
+  ahh_S_BH <- which(as.vector(adh_BH) == TRUE)
+  results_list_BH[[i]] <- fdp_power(selected_index = ahh_S_BH, signal_index = signal_index)
+  # Apply BY method
+  adh_BY <- p.adjust(p_values_upper, method = "BY") < 0.1
+  ahh_S_BY <- which(as.vector(adh_BY) == TRUE)
+  results_list_BY[[i]] <- fdp_power(selected_index = ahh_S_BY, signal_index = signal_index)
+}
+
+elements_BH <- names(results_list_BH[[1]])
+empirical_results_BH <- sapply(elements_BH, function(element) {
+  values <- sapply(results_list_BH, function(res) res[[element]])
+  mean.se(values, ns = 2)
+})
+
+elements_BY <- names(results_list_BY[[1]])
+empirical_results_BY <- sapply(elements_BY, function(element) {
+  values <- sapply(results_list_BY, function(res) res[[element]])
+  mean.se(values, ns = 2)
+})
+
+list(BH = empirical_results_BH, BY = empirical_results_BY)
+```
+#### 200,300
+```{r}
+p <- 200
+n <- 300
+Sigma_0 <- sigma_0(p)
+mean_vector <- rep(0, p)
+set.seed(2024)
+for (i in 1:replications) {
+  X <- mvrnorm(n = n, mu = mean_vector, Sigma = Sigma_0)
+  signal_index <- Signal_index(Sigma_0)
+  # Apply BH method
+  p_values_upper <- get_p_value(X, p, n)
+  adh_BH <- p.adjust(p_values_upper, method = "BH") < 0.1
+  ahh_S_BH <- which(as.vector(adh_BH) == TRUE)
+  results_list_BH[[i]] <- fdp_power(selected_index = ahh_S_BH, signal_index = signal_index)
+  # Apply BY method
+  adh_BY <- p.adjust(p_values_upper, method = "BY") < 0.1
+  ahh_S_BY <- which(as.vector(adh_BY) == TRUE)
+  results_list_BY[[i]] <- fdp_power(selected_index = ahh_S_BY, signal_index = signal_index)
+}
+
+elements_BH <- names(results_list_BH[[1]])
+empirical_results_BH <- sapply(elements_BH, function(element) {
+  values <- sapply(results_list_BH, function(res) res[[element]])
+  mean.se(values, ns = 2)
+})
+
+elements_BY <- names(results_list_BY[[1]])
+empirical_results_BY <- sapply(elements_BY, function(element) {
+  values <- sapply(results_list_BY, function(res) res[[element]])
+  mean.se(values, ns = 2)
+})
+
+list(BH = empirical_results_BH, BY = empirical_results_BY)
+```
+
+#### 300,300
+```{r}
+p <- 300
+n <- 300
+Sigma_0 <- sigma_0(p)
+mean_vector <- rep(0, p)
+set.seed(2024)
+for (i in 1:replications) {
+  X <- mvrnorm(n = n, mu = mean_vector, Sigma = Sigma_0)
+  signal_index <- Signal_index(Sigma_0)
+  # Apply BH method
+  p_values_upper <- get_p_value(X, p, n)
+  adh_BH <- p.adjust(p_values_upper, method = "BH") < 0.1
+  ahh_S_BH <- which(as.vector(adh_BH) == TRUE)
+  results_list_BH[[i]] <- fdp_power(selected_index = ahh_S_BH, signal_index = signal_index)
+  # Apply BY method
+  adh_BY <- p.adjust(p_values_upper, method = "BY") < 0.1
+  ahh_S_BY <- which(as.vector(adh_BY) == TRUE)
+  results_list_BY[[i]] <- fdp_power(selected_index = ahh_S_BY, signal_index = signal_index)
+}
+
+elements_BH <- names(results_list_BH[[1]])
+empirical_results_BH <- sapply(elements_BH, function(element) {
+  values <- sapply(results_list_BH, function(res) res[[element]])
+  mean.se(values, ns = 2)
+})
+
+elements_BY <- names(results_list_BY[[1]])
+empirical_results_BY <- sapply(elements_BY, function(element) {
+  values <- sapply(results_list_BY, function(res) res[[element]])
+  mean.se(values, ns = 2)
+})
+
+list(BH = empirical_results_BH, BY = empirical_results_BY)
+```
+#### 500, 800
+```{r}
+p <- 500
+n <- 800
+Sigma_0 <- sigma_0(p)
+mean_vector <- rep(0, p)
+set.seed(2024)
+for (i in 1:replications) {
+  X <- mvrnorm(n = n, mu = mean_vector, Sigma = Sigma_0)
+  signal_index <- Signal_index(Sigma_0)
+  # Apply BH method
+  p_values_upper <- get_p_value(X, p, n)
+  adh_BH <- p.adjust(p_values_upper, method = "BH") < 0.1
+  ahh_S_BH <- which(as.vector(adh_BH) == TRUE)
+  results_list_BH[[i]] <- fdp_power(selected_index = ahh_S_BH, signal_index = signal_index)
+  # Apply BY method
+  adh_BY <- p.adjust(p_values_upper, method = "BY") < 0.1
+  ahh_S_BY <- which(as.vector(adh_BY) == TRUE)
+  results_list_BY[[i]] <- fdp_power(selected_index = ahh_S_BY, signal_index = signal_index)
+}
+
+elements_BH <- names(results_list_BH[[1]])
+empirical_results_BH <- sapply(elements_BH, function(element) {
+  values <- sapply(results_list_BH, function(res) res[[element]])
+  mean.se(values, ns = 2)
+})
+
+elements_BY <- names(results_list_BY[[1]])
+empirical_results_BY <- sapply(elements_BY, function(element) {
+  values <- sapply(results_list_BY, function(res) res[[element]])
+  mean.se(values, ns = 2)
+})
+
+list(BH = empirical_results_BH, BY = empirical_results_BY)
+```
+
+#### 500, 1000
+```{r}
+p <- 500
+n <- 1000
+Sigma_0 <- sigma_0(p)
+set.seed(2024) 
+mean_vector <- rep(0, p)
+X <- mvrnorm(n = n, mu = mean_vector, Sigma = Sigma_0)
+signal_index <- Signal_index(Sigma_0)
+```
+
+```{r}
+# Apply BH method to control FDR
+p_values_upper <- get_p_value(X, p, n)
+adh <-  p.adjust(p_values_upper, method = "BH") < 0.1  # Set q = 0.1 
+ahh.S <- which(as.vector(adh) == TRUE)
+
+# Calculate FDP and Power using the BH method
+fdp_power9 <- fdp_power(selected_index = ahh.S, signal_index = signal_index)
+
+# Print the FDP and Power for BH method
+print(fdp_power9)
+```
+```{r}
+# Apply BY method to control FDR
+p_values_upper <- get_p_value(X, p, n)
+adh <-  p.adjust(p_values_upper, method = "BY") < 0.1  # Set q = 0.1 
+ahh.S <- which(as.vector(adh) == TRUE)
+fdp_power9 <- fdp_power(selected_index = ahh.S, signal_index = signal_index)
+print(fdp_power9)
+```
+#### 500, 1500
+```{r}
+p <- 500
+n <- 1500
+Sigma_0 <- sigma_0(p)
+set.seed(2024) 
+mean_vector <- rep(0, p)
+X <- mvrnorm(n = n, mu = mean_vector, Sigma = Sigma_0)
+signal_index <- Signal_index(Sigma_0)
+```
+
+```{r}
+# Apply BH method to control FDR
+p_values_upper <- get_p_value(X, p, n)
+adh <-  p.adjust(p_values_upper, method = "BH") < 0.1  # Set q = 0.1 
+ahh.S <- which(as.vector(adh) == TRUE)
+
+# Calculate FDP and Power using the BH method
+fdp_power9 <- fdp_power(selected_index = ahh.S, signal_index = signal_index)
+
+# Print the FDP and Power for BH method
+print(fdp_power9)
+```
+```{r}
+# Apply BY method to control FDR
+p_values_upper <- get_p_value(X, p, n)
+adh <-  p.adjust(p_values_upper, method = "BY") < 0.1  # Set q = 0.1 
+ahh.S <- which(as.vector(adh) == TRUE)
+fdp_power9 <- fdp_power(selected_index = ahh.S, signal_index = signal_index)
+print(fdp_power9)
+```
+#### 500, 2000
+```{r}
+p <- 500
+n <- 2000
+Sigma_0 <- sigma_0(p)
+set.seed(2024) 
+mean_vector <- rep(0, p)
+X <- mvrnorm(n = n, mu = mean_vector, Sigma = Sigma_0)
+signal_index <- Signal_index(Sigma_0)
+```
+
+```{r}
+# Apply BH method to control FDR
+p_values_upper <- get_p_value(X, p, n)
+adh <-  p.adjust(p_values_upper, method = "BH") < 0.1  # Set q = 0.1 
+ahh.S <- which(as.vector(adh) == TRUE)
+
+# Calculate FDP and Power using the BH method
+fdp_power9 <- fdp_power(selected_index = ahh.S, signal_index = signal_index)
+
+# Print the FDP and Power for BH method
+print(fdp_power9)
+```
+```{r}
+# Apply BY method to control FDR
+p_values_upper <- get_p_value(X, p, n)
+adh <-  p.adjust(p_values_upper, method = "BY") < 0.1  # Set q = 0.1 
+ahh.S <- which(as.vector(adh) == TRUE)
+fdp_power9 <- fdp_power(selected_index = ahh.S, signal_index = signal_index)
+print(fdp_power9)
+```
+#### 500, 2500
+```{r}
+p <- 500
+n <- 2500
+Sigma_0 <- sigma_0(p)
+set.seed(2024) 
+mean_vector <- rep(0, p)
+X <- mvrnorm(n = n, mu = mean_vector, Sigma = Sigma_0)
+signal_index <- Signal_index(Sigma_0)
+```
+
+```{r}
+# Apply BH method to control FDR
+p_values_upper <- get_p_value(X, p, n)
+adh <-  p.adjust(p_values_upper, method = "BH") < 0.1  # Set q = 0.1 
+ahh.S <- which(as.vector(adh) == TRUE)
+
+# Calculate FDP and Power using the BH method
+fdp_power9 <- fdp_power(selected_index = ahh.S, signal_index = signal_index)
+
+# Print the FDP and Power for BH method
+print(fdp_power9)
+```
+```{r}
+# Apply BY method to control FDR
+p_values_upper <- get_p_value(X, p, n)
+adh <-  p.adjust(p_values_upper, method = "BY") < 0.1  # Set q = 0.1 
+ahh.S <- which(as.vector(adh) == TRUE)
+fdp_power9 <- fdp_power(selected_index = ahh.S, signal_index = signal_index)
+print(fdp_power9)
+```
+#### 500, 3000
+```{r}
+p <- 500
+n <- 3000
+Sigma_0 <- sigma_0(p)
+set.seed(2024) 
+mean_vector <- rep(0, p)
+X <- mvrnorm(n = n, mu = mean_vector, Sigma = Sigma_0)
+signal_index <- Signal_index(Sigma_0)
+```
+
+```{r}
+# Apply BH method to control FDR
+p_values_upper <- get_p_value(X, p, n)
+adh <-  p.adjust(p_values_upper, method = "BH") < 0.1  # Set q = 0.1 
+ahh.S <- which(as.vector(adh) == TRUE)
+
+# Calculate FDP and Power using the BH method
+fdp_power9 <- fdp_power(selected_index = ahh.S, signal_index = signal_index)
+
+# Print the FDP and Power for BH method
+print(fdp_power9)
+```
+```{r}
+# Apply BY method to control FDR
+p_values_upper <- get_p_value(X, p, n)
+adh <-  p.adjust(p_values_upper, method = "BY") < 0.1  # Set q = 0.1 
+ahh.S <- which(as.vector(adh) == TRUE)
+fdp_power9 <- fdp_power(selected_index = ahh.S, signal_index = signal_index)
+print(fdp_power9)
+```
+#### 500, 5000
+```{r}
+p <- 500
+n <- 5000
+Sigma_0 <- sigma_0(p)
+set.seed(2024) 
+mean_vector <- rep(0, p)
+X <- mvrnorm(n = n, mu = mean_vector, Sigma = Sigma_0)
+signal_index <- Signal_index(Sigma_0)
+```
+
+```{r}
+# Apply BH method to control FDR
+p_values_upper <- get_p_value(X, p, n)
+adh <-  p.adjust(p_values_upper, method = "BH") < 0.1  # Set q = 0.1 
+ahh.S <- which(as.vector(adh) == TRUE)
+
+# Calculate FDP and Power using the BH method
+fdp_power9 <- fdp_power(selected_index = ahh.S, signal_index = signal_index)
+
+# Print the FDP and Power for BH method
+print(fdp_power9)
+```
+```{r}
+# Apply BY method to control FDR
+p_values_upper <- get_p_value(X, p, n)
+adh <-  p.adjust(p_values_upper, method = "BY") < 0.1  # Set q = 0.1 
+ahh.S <- which(as.vector(adh) == TRUE)
+fdp_power9 <- fdp_power(selected_index = ahh.S, signal_index = signal_index)
+print(fdp_power9)
+```
+#### 1000, 2000
+```{r}
+p <- 1000
+n <- 2000
+Sigma_0 <- sigma_0(p)
+set.seed(2024) 
+mean_vector <- rep(0, p)
+X <- mvrnorm(n = n, mu = mean_vector, Sigma = Sigma_0)
+signal_index <- Signal_index(Sigma_0)
+```
+
+```{r}
+# Apply BH method to control FDR
+p_values_upper <- get_p_value(X, p, n)
+adh <-  p.adjust(p_values_upper, method = "BH") < 0.1  # Set q = 0.1 
+ahh.S <- which(as.vector(adh) == TRUE)
+
+# Calculate FDP and Power using the BH method
+fdp_power9 <- fdp_power(selected_index = ahh.S, signal_index = signal_index)
+
+# Print the FDP and Power for BH method
+print(fdp_power9)
+```
+```{r}
+# Apply BY method to control FDR
+p_values_upper <- get_p_value(X, p, n)
+adh <-  p.adjust(p_values_upper, method = "BY") < 0.1  # Set q = 0.1 
+ahh.S <- which(as.vector(adh) == TRUE)
+fdp_power9 <- fdp_power(selected_index = ahh.S, signal_index = signal_index)
+print(fdp_power9)
+```
+### Bonferroni
+```{r}
+bonferroni_fdp_power <- function(p, n, q = 0.1) {
+  # Generate data from multivariate normal distribution
+  Sigma_0 <- sigma_0(p)
+  mean_vector <- rep(0, p)
+  X <- mvrnorm(n = n, mu = mean_vector, Sigma = Sigma_0)
+  signal_index <- Signal_index(Sigma_0)
+
+  # Calculate p-values for upper triangular elements
+  p_values_upper <- get_p_value(X, p, n)
+
+  # Apply Bonferroni correction: compare each p-value to alpha / m
+  adh <- p_values_upper < (q / length(p_values_upper))
+  ahh.S <- which(as.vector(adh) == TRUE)
+
+  # Calculate FDP and Power using the Bonferroni results
+  fdp_power_result <- fdp_power(ahh.S, signal_index)
+
+  return(fdp_power_result)
+}
+
+replications <- 50
+results_list <- vector("list", replications)
+```
+#### 10,300
+```{r}
+p <- 10
+n <- 300
+set.seed(2024)
+for (i in 1:replications) {
+  results_list[[i]] <- bonferroni_fdp_power(p, n, q = 0.1)
+}
+elements <- names(results_list[[1]])
+empirical_results <- sapply(elements, function(element) {
+  values <- sapply(results_list, function(res) res[[element]])
+  mean.se(values, ns = 2)
+})
+
+empirical_results
+```
+#### 50,300
+```{r}
+p <- 50
+n <- 300
+set.seed(2024)
+for (i in 1:replications) {
+  results_list[[i]] <- bonferroni_fdp_power(p, n, q = 0.1)
+}
+elements <- names(results_list[[1]])
+empirical_results <- sapply(elements, function(element) {
+  values <- sapply(results_list, function(res) res[[element]])
+  mean.se(values, ns = 2)
+})
+
+empirical_results
+```
+
+#### 100,300
+```{r}
+p <- 100
+n <- 300
+set.seed(2024)
+for (i in 1:replications) {
+  results_list[[i]] <- bonferroni_fdp_power(p, n, q = 0.1)
+}
+elements <- names(results_list[[1]])
+empirical_results <- sapply(elements, function(element) {
+  values <- sapply(results_list, function(res) res[[element]])
+  mean.se(values, ns = 2)
+})
+
+empirical_results
+```
+
+#### 200,300
+```{r}
+p <- 200
+n <- 300
+set.seed(2024)
+for (i in 1:replications) {
+  results_list[[i]] <- bonferroni_fdp_power(p, n, q = 0.1)
+}
+elements <- names(results_list[[1]])
+empirical_results <- sapply(elements, function(element) {
+  values <- sapply(results_list, function(res) res[[element]])
+  mean.se(values, ns = 2)
+})
+
+empirical_results
+```
+#### 300,300
+```{r}
+p <- 300
+n <- 300
+set.seed(2024)
+for (i in 1:replications) {
+  results_list[[i]] <- bonferroni_fdp_power(p, n, q = 0.1)
+}
+elements <- names(results_list[[1]])
+empirical_results <- sapply(elements, function(element) {
+  values <- sapply(results_list, function(res) res[[element]])
+  mean.se(values, ns = 2)
+})
+
+empirical_results
+```
+#### 500,800
+```{r}
+p <- 500
+n <- 800
+set.seed(2024)
+for (i in 1:replications) {
+  results_list[[i]] <- bonferroni_fdp_power(p, n, q = 0.1)
+}
+elements <- names(results_list[[1]])
+empirical_results <- sapply(elements, function(element) {
+  values <- sapply(results_list, function(res) res[[element]])
+  mean.se(values, ns = 2)
+})
+
+empirical_results
+```
+#### 500,1000
+```{r}
+# Set parameters
+p <- 500
+n <- 1000
+result <- bonferroni_fdp_power(p, n, q = 0.1)
+```
+#### 500,1500
+```{r}
+# Set parameters
+p <- 500
+n <- 1500
+result <- bonferroni_fdp_power(p, n, q = 0.1)
+```
+#### 500,2000
+```{r}
+# Set parameters
+p <- 500
+n <- 2000
+result <- bonferroni_fdp_power(p, n, q = 0.1)
+```
+#### 500,2500
+```{r}
+# Set parameters
+p <- 500
+n <- 2500
+result <- bonferroni_fdp_power(p, n, q = 0.1)
+```
+#### 500,3000
+```{r}
+# Set parameters
+p <- 500
+n <- 3000
+result <- bonferroni_fdp_power(p, n, q = 0.1)
+```
+#### 500,5000
+```{r}
+# Set parameters
+p <- 500
+n <- 5000
+result <- bonferroni_fdp_power(p, n, q = 0.1)
+```
+#### 1000,2000
+```{r}
+# Set parameters
+p <- 1000
+n <- 2000
+result <- bonferroni_fdp_power(p, n, q = 0.1)
+```

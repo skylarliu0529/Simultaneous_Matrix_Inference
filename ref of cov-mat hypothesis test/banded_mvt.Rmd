@@ -233,10 +233,6 @@ empirical_results <- sapply(elements, function(element) {
 
 empirical_results
 ```
-df=5，用case 2 做t分布
-# 做正态的相关系数#overleaf表格和原来的区分开，写model size，写simulation process
-# 基于e value的想法写进文章，和原来的方法可比。
-# 实际数据找一下
 ### p=50, n=300
 ```{r}
 p <- 50
